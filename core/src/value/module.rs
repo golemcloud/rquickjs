@@ -274,6 +274,9 @@ impl<'js> Module<'js, Declared> {
         let module_ptr = unsafe {
             NonNull::new(qjs::JS_VALUE_GET_PTR(module_val).cast()).ok_or(Error::Unknown)?
         };
+        // The context's module list keeps the module alive; release the compile result,
+        // as quickjs-libc's module loader does.
+        unsafe { qjs::JS_FreeValue(ctx.as_ptr(), module_val) };
         unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
     }
 
@@ -349,6 +352,8 @@ impl<'js> Module<'js, Declared> {
         debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe { qjs::JS_VALUE_GET_TAG(module) });
         let module_ptr =
             unsafe { NonNull::new(qjs::JS_VALUE_GET_PTR(module).cast()).ok_or(Error::Unknown)? };
+        // The context's module list keeps the module alive; release the read result.
+        unsafe { qjs::JS_FreeValue(ctx.as_ptr(), module) };
         unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
     }
 
@@ -750,5 +755,56 @@ mod test {
 
             assert_eq!(ns.get::<_, u32>("a").unwrap(), 2u32);
         });
+    }
+
+    // A pending top-level await keeps its module alive past the context's module list.
+    fn release_pending_module(source: &str) {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let (module, promise) = Module::declare(ctx.clone(), "pending.mjs", source)
+                .unwrap()
+                .eval()
+                .unwrap();
+            ctx.globals().set("evaluation", promise).unwrap();
+            let ns = module.namespace().unwrap();
+            ns.get::<_, i32>("result").unwrap_err();
+        });
+        while runtime.execute_pending_job().unwrap() {}
+        drop(context);
+        drop(runtime);
+    }
+
+    #[test]
+    fn pending_module_teardown() {
+        release_pending_module("await new Promise(() => {}); export const result = 1;");
+        release_pending_module(
+            "const p = new Promise(() => {}); p.self = p; await p; export const result = 1;",
+        );
+        release_pending_module(
+            "await (() => { const p = new Promise(() => {}); p.self = p; return p; })(); \
+             export const result = 1;",
+        );
+    }
+
+    #[test]
+    fn bytecode_module_teardown() {
+        let bytecode = test_with(|ctx| {
+            Module::declare(ctx, "bytecode.mjs", "export const value = 42;")
+                .unwrap()
+                .write(WriteOptions::default())
+                .unwrap()
+        });
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let module = unsafe { Module::load(ctx.clone(), &bytecode) }.unwrap();
+            let (module, promise) = module.eval().unwrap();
+            promise.finish::<()>().unwrap();
+            let ns = module.namespace().unwrap();
+            assert_eq!(ns.get::<_, i32>("value").unwrap(), 42);
+        });
+        drop(context);
+        drop(runtime);
     }
 }
