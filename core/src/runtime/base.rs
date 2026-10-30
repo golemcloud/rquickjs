@@ -6,9 +6,13 @@ use super::{
 use crate::allocator::Allocator;
 #[cfg(feature = "loader")]
 use crate::loader::{Loader, Resolver};
-use crate::{qjs, result::JobException, Context, Mut, Ref, Result, Weak};
+#[cfg(feature = "parallel")]
+use crate::qjs;
+use crate::{result::JobException, Context, Mut, Ref, Result, Weak};
 use alloc::{ffi::CString, vec::Vec};
-use core::{ptr::NonNull, result::Result as StdResult};
+#[cfg(feature = "parallel")]
+use core::ptr::NonNull;
+use core::result::Result as StdResult;
 #[cfg(feature = "parallel")]
 use std::sync::mpsc::{self, Sender};
 
@@ -216,13 +220,15 @@ impl Runtime {
     pub fn execute_pending_job(&self) -> StdResult<bool, JobException> {
         let mut lock = self.inner.lock();
         lock.update_stack_top();
-        lock.execute_pending_job().map_err(|e| {
-            let ptr = NonNull::new(e).expect("QuickJS returned null ptr for job error");
-            // JS_ExecutePendingJob returns a borrowed context pointer;
-            // dup it so Context can own a reference.
-            unsafe { qjs::JS_DupContext(ptr.as_ptr()) };
-            JobException(unsafe { Context::from_raw(ptr, self.clone()) })
-        })
+        match lock.execute_pending_job() {
+            Ok(executed) => Ok(executed),
+            Err(e) => {
+                let ptr = unsafe { lock.job_error_context(e) };
+                Err(JobException(unsafe {
+                    Context::from_raw(ptr, self.clone())
+                }))
+            }
+        }
     }
 }
 
@@ -244,6 +250,24 @@ unsafe impl Sync for WeakRuntime {}
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // JS_ExecutePendingJob() reports no context when a failed job held the last
+    // reference to its realm; the exception then stays pending on the runtime.
+    #[test]
+    fn job_error_context_without_reported_context() {
+        use crate::qjs;
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| unsafe {
+            qjs::JS_Throw(ctx.as_ptr(), qjs::JS_MKVAL(qjs::JS_TAG_INT, 7));
+        });
+        let ptr = unsafe { rt.inner.lock().job_error_context(core::ptr::null_mut()) };
+        let error_ctx = unsafe { Context::from_raw(ptr, rt.clone()) };
+        error_ctx.with(|ctx| {
+            assert_eq!(ctx.catch().as_int(), Some(7));
+        });
+    }
+
     #[test]
     fn base_runtime() {
         let rt = Runtime::new().unwrap();

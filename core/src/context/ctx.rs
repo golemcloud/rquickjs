@@ -407,8 +407,16 @@ impl<'js> Ctx<'js> {
             // surfacing it here. Drain it so it can't be mistaken for a real
             // exception later by unrelated code that checks for one (e.g. the
             // module loader's "is a module already loaded" check).
-            let ctx = unsafe { Self::from_ptr(ptr.assume_init()) };
-            ctx.catch();
+            match NonNull::new(unsafe { ptr.assume_init() }) {
+                Some(ptr) => {
+                    unsafe { Self::from_ptr(ptr.as_ptr()) }.catch();
+                }
+                // The job held the last reference to its realm. The exception is
+                // kept per runtime, so drain it through this context.
+                None => {
+                    self.catch();
+                }
+            }
         }
         res != 0
     }

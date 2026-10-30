@@ -3,7 +3,9 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{ptr::NonNull, result::Result as StdResult, task::Poll};
+#[cfg(feature = "parallel")]
+use core::ptr::NonNull;
+use core::{result::Result as StdResult, task::Poll};
 #[cfg(feature = "std")]
 use std::println;
 
@@ -20,9 +22,11 @@ use crate::allocator::Allocator;
 #[cfg(feature = "loader")]
 use crate::loader::{Loader, Resolver};
 #[cfg(feature = "parallel")]
+use crate::qjs;
+#[cfg(feature = "parallel")]
 use crate::util::{AssertSendFuture, AssertSyncFuture};
 use crate::{
-    context::AsyncContext, qjs, result::AsyncJobException, util::ManualPoll, Ctx, Exception, Result,
+    context::AsyncContext, result::AsyncJobException, util::ManualPoll, Ctx, Exception, Result,
 };
 
 #[derive(Debug)]
@@ -269,14 +273,15 @@ impl AsyncRuntime {
         lock.runtime.drain_pending_free();
 
         let f = ManualPoll::new(|cx| {
-            let job_res = lock.runtime.execute_pending_job().map_err(|e| {
-                let ptr = NonNull::new(e)
-                    .expect("executing pending job returned a null context on error");
-                // JS_ExecutePendingJob returns a borrowed context pointer;
-                // dup it so AsyncContext can own a reference.
-                unsafe { qjs::JS_DupContext(ptr.as_ptr()) };
-                AsyncJobException(unsafe { AsyncContext::from_raw(ptr, self.clone()) })
-            })?;
+            let job_res = match lock.runtime.execute_pending_job() {
+                Ok(executed) => executed,
+                Err(e) => {
+                    let ptr = unsafe { lock.runtime.job_error_context(e) };
+                    return Poll::Ready(Err(AsyncJobException(unsafe {
+                        AsyncContext::from_raw(ptr, self.clone())
+                    })));
+                }
+            };
 
             if job_res {
                 return Poll::Ready(Ok(true));
@@ -305,14 +310,15 @@ impl AsyncRuntime {
 
         let f = ManualPoll::new(|cx| {
             loop {
-                let pending = lock.runtime.execute_pending_job().map_err(|e| {
-                    let ptr = NonNull::new(e)
-                        .expect("executing pending job returned a null context on error");
-                    // JS_ExecutePendingJob returns a borrowed context pointer;
-                    // dup it so AsyncContext can own a reference.
-                    unsafe { qjs::JS_DupContext(ptr.as_ptr()) };
-                    AsyncJobException(unsafe { AsyncContext::from_raw(ptr, self.clone()) })
-                });
+                let pending = match lock.runtime.execute_pending_job() {
+                    Ok(executed) => Ok(executed),
+                    Err(e) => {
+                        let ptr = unsafe { lock.runtime.job_error_context(e) };
+                        Err(AsyncJobException(unsafe {
+                            AsyncContext::from_raw(ptr, self.clone())
+                        }))
+                    }
+                };
                 match pending {
                     Err(e) => {
                         // SAFETY: Runtime is already locked so creating a context is safe.

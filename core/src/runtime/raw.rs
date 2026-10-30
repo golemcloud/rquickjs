@@ -264,6 +264,26 @@ impl RawRuntime {
         Err(unsafe { ctx_ptr.assume_init() })
     }
 
+    /// Returns an owned reference to the context reported for a failed job.
+    ///
+    /// The reported pointer is borrowed, so it is duplicated. It is null when the job held
+    /// the last reference to its realm; the exception stays pending on the runtime, so a
+    /// new base context is created to expose it.
+    pub(crate) unsafe fn job_error_context(
+        &self,
+        ctx: *mut qjs::JSContext,
+    ) -> NonNull<qjs::JSContext> {
+        if let Some(ctx) = NonNull::new(ctx) {
+            unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
+            return ctx;
+        }
+        let ctx = NonNull::new(unsafe { qjs::JS_NewContextRaw(self.rt.as_ptr()) })
+            .expect("failed to create a context for a job error");
+        // rquickjs assumes the base objects exist.
+        unsafe { qjs::JS_AddIntrinsicBaseObjects(ctx.as_ptr()) };
+        ctx
+    }
+
     #[cfg(feature = "loader")]
     pub unsafe fn set_loader<R, L>(&mut self, resolver: R, loader: L)
     where
