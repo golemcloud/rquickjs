@@ -268,6 +268,79 @@ mod test {
         });
     }
 
+    fn set_owner(ctx: &crate::Ctx<'_>, owner: u64) {
+        unsafe {
+            crate::runtime::job_owner::set(crate::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()), owner)
+        };
+    }
+
+    fn take_order(ctx: &crate::Ctx<'_>) -> String {
+        ctx.eval("(() => { const o = order.join(','); order.length = 0; return o; })()")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_reaction_runs_for_the_owner_that_registered_it() {
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>("globalThis.order = []; let resolve; globalThis.p = new Promise(r => resolve = r); globalThis.resolve = resolve;").unwrap();
+            set_owner(&ctx, 1);
+            ctx.eval::<(), _>("p.then(() => order.push('registered by 1'))").unwrap();
+            set_owner(&ctx, 2);
+            ctx.eval::<(), _>("Promise.resolve().then(() => order.push('2')); resolve()")
+                .unwrap();
+        });
+        while rt.execute_pending_job().unwrap() {}
+        ctx.with(|ctx| {
+            assert_eq!(take_order(&ctx), "2");
+            set_owner(&ctx, 1);
+        });
+        assert!(rt.is_job_pending());
+        while rt.execute_pending_job().unwrap() {}
+        ctx.with(|ctx| assert_eq!(take_order(&ctx), "registered by 1"));
+    }
+
+    #[test]
+    fn a_redirect_chooses_the_owner_of_a_reaction_triggered_by_another_owner() {
+        fn to_owner_3(registered: u64, current: u64) -> u64 {
+            assert_eq!((registered, current), (1, 2));
+            3
+        }
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let raw = unsafe { crate::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()) };
+            unsafe { crate::runtime::job_owner::set_redirect(raw, Some(to_owner_3)) };
+            ctx.eval::<(), _>("globalThis.order = []; let resolve; globalThis.p = new Promise(r => resolve = r); globalThis.resolve = resolve;").unwrap();
+            set_owner(&ctx, 1);
+            ctx.eval::<(), _>("p.then(() => order.push('registered by 1'))").unwrap();
+            set_owner(&ctx, 2);
+            ctx.eval::<(), _>("resolve()").unwrap();
+            set_owner(&ctx, 1);
+        });
+        assert!(!rt.is_job_pending());
+        ctx.with(|ctx| set_owner(&ctx, 2));
+        assert!(!rt.is_job_pending());
+        ctx.with(|ctx| set_owner(&ctx, 3));
+        while rt.execute_pending_job().unwrap() {}
+        ctx.with(|ctx| assert_eq!(take_order(&ctx), "registered by 1"));
+    }
+
+    #[test]
+    fn dropping_a_runtime_frees_the_jobs_of_every_owner() {
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            set_owner(&ctx, 1);
+            ctx.eval::<(), _>("Promise.resolve({ held: [1, 2, 3] }).then(v => v)")
+                .unwrap();
+            set_owner(&ctx, 2);
+        });
+        drop(ctx);
+        drop(rt);
+    }
+
     #[test]
     fn base_runtime() {
         let rt = Runtime::new().unwrap();
