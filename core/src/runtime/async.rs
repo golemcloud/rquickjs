@@ -500,6 +500,42 @@ mod test {
 
     });
 
+    async_test_case!(job_owners => (rt,ctx){
+        use std::sync::{Arc, atomic::{Ordering,AtomicUsize}};
+
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawned_clone = spawned.clone();
+
+        ctx.async_with(async |ctx|{
+            let raw = unsafe { qjs::JS_GetRuntime(ctx.as_raw().as_ptr()) };
+            unsafe { crate::runtime::job_owner::set(raw, 1) };
+            ctx.spawn(async move {
+                tokio::task::yield_now().await;
+                spawned_clone.store(1,Ordering::SeqCst);
+            });
+            let _: () = ctx.eval("globalThis.jobs = []; Promise.resolve().then(() => jobs.push(1));").unwrap();
+            unsafe { crate::runtime::job_owner::set(raw, 2) };
+        }).await;
+
+        // Owner 2 has no work, so idling under it runs nothing of owner 1.
+        rt.idle().await;
+        assert_eq!(spawned.load(Ordering::SeqCst),0);
+        assert!(!rt.is_job_pending().await);
+
+        ctx.async_with(async |ctx|{
+            let jobs: usize = ctx.eval("jobs.length").unwrap();
+            assert_eq!(jobs, 0);
+            unsafe { crate::runtime::job_owner::set(qjs::JS_GetRuntime(ctx.as_raw().as_ptr()), 1) };
+        }).await;
+        assert!(rt.is_job_pending().await);
+        rt.idle().await;
+        assert_eq!(spawned.load(Ordering::SeqCst),1);
+        ctx.async_with(async |ctx|{
+            let jobs: usize = ctx.eval("jobs.length").unwrap();
+            assert_eq!(jobs, 1);
+        }).await;
+    });
+
     async_test_case!(recursive_spawn => (rt,ctx){
         use tokio::sync::oneshot;
 

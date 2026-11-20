@@ -136,6 +136,7 @@ impl Drop for RawRuntime {
         unsafe {
             let ptr = qjs::JS_GetRuntimeOpaque(self.rt.as_ptr());
             let mut opaque: Box<Opaque> = Box::from_raw(ptr as *mut _);
+            opaque.free_jobs(self.rt.as_ptr());
             opaque.clear();
             qjs::JS_FreeRuntime(self.rt.as_ptr());
             mem::drop(opaque);
@@ -247,12 +248,16 @@ impl RawRuntime {
     }
 
     pub fn is_job_pending(&self) -> bool {
-        (unsafe { qjs::JS_IsJobPending(self.rt.as_ptr()) } as i32) != 0
+        self.get_opaque().is_job_pending()
     }
 
     pub fn execute_pending_job(&mut self) -> StdResult<bool, *mut qjs::JSContext> {
+        let Some(job) = self.get_opaque().take_job() else {
+            return Ok(false);
+        };
         let mut ctx_ptr = mem::MaybeUninit::<*mut qjs::JSContext>::uninit();
-        let result = unsafe { qjs::JS_ExecutePendingJob(self.rt.as_ptr(), ctx_ptr.as_mut_ptr()) };
+        let result =
+            unsafe { qjs::JS_ExecuteJob(self.rt.as_ptr(), job.as_ptr(), ctx_ptr.as_mut_ptr()) };
         if result == 0 {
             // no jobs executed
             return Ok(false);

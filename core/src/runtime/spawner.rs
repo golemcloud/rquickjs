@@ -3,8 +3,9 @@ use super::{
     AsyncWeakRuntime, InnerRuntime,
 };
 use crate::AsyncRuntime;
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 use core::{
+    cell::RefCell,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll, Waker},
@@ -13,37 +14,70 @@ use core::{
 use async_lock::futures::LockArc;
 
 /// A structure to hold futures spawned inside the runtime.
+///
+/// Futures are kept per job owner (see `runtime::job_owner`): a future spawned while an owner is
+/// current is only polled while that owner is current, so it is only driven by that owner's
+/// drivers. An owner's entry is dropped once nothing is spawned under it.
 pub struct Spawner {
-    schedular: Schedular,
-    wakeup: Vec<Waker>,
+    schedulars: RefCell<BTreeMap<u64, Rc<Schedular>>>,
+    wakeup: RefCell<Vec<Waker>>,
 }
 
 impl Spawner {
     pub fn new() -> Self {
         Spawner {
-            schedular: Schedular::new(),
-            wakeup: Vec::new(),
+            schedulars: RefCell::new(BTreeMap::new()),
+            wakeup: RefCell::new(Vec::new()),
         }
     }
 
-    pub unsafe fn push<F>(&mut self, f: F)
+    pub unsafe fn push<F>(&self, owner: u64, f: F)
     where
         F: Future<Output = ()>,
     {
-        unsafe { self.schedular.push(f) };
-        self.wakeup.drain(..).for_each(Waker::wake);
+        let schedular = self
+            .schedulars
+            .borrow_mut()
+            .entry(owner)
+            .or_insert_with(|| Rc::new(Schedular::new()))
+            .clone();
+        unsafe { schedular.push(f) };
+        let wakeup = core::mem::take(&mut *self.wakeup.borrow_mut());
+        wakeup.into_iter().for_each(Waker::wake);
     }
 
-    pub fn listen(&mut self, wake: Waker) {
-        self.wakeup.push(wake);
+    /// Registers a waker that is woken when a future is spawned under any owner.
+    pub fn listen(&self, wake: Waker) {
+        let mut wakeup = self.wakeup.borrow_mut();
+        if !wakeup.iter().any(|existing| existing.will_wake(&wake)) {
+            wakeup.push(wake);
+        }
     }
 
-    pub fn is_empty(&mut self) -> bool {
-        self.schedular.is_empty()
+    pub fn is_empty(&self, owner: u64) -> bool {
+        self.schedulars
+            .borrow()
+            .get(&owner)
+            .is_none_or(|schedular| schedular.is_empty())
     }
 
-    pub fn poll(&mut self, cx: &mut Context) -> SchedularPoll {
-        unsafe { self.schedular.poll(cx) }
+    pub fn poll(&self, owner: u64, cx: &mut Context) -> SchedularPoll {
+        let Some(schedular) = self.schedulars.borrow().get(&owner).cloned() else {
+            return SchedularPoll::Empty;
+        };
+        let result = unsafe { schedular.poll(cx) };
+        let idle = schedular.is_empty();
+        drop(schedular);
+        if idle {
+            let mut schedulars = self.schedulars.borrow_mut();
+            if schedulars
+                .get(&owner)
+                .is_some_and(|schedular| Rc::strong_count(schedular) == 1 && schedular.is_empty())
+            {
+                schedulars.remove(&owner);
+            }
+        }
+        result
     }
 }
 
