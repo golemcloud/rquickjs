@@ -397,11 +397,14 @@ impl<'js> Ctx<'js> {
     /// Returns wether a job was actually executed.
     /// If this function returned false, no job was pending.
     pub fn execute_pending_job(&self) -> bool {
+        let Some(job) = (unsafe { self.get_opaque() }).take_job() else {
+            return false;
+        };
         let mut ptr = MaybeUninit::<*mut qjs::JSContext>::uninit();
         let rt = unsafe { qjs::JS_GetRuntime(self.ctx.as_ptr()) };
-        let res = unsafe { qjs::JS_ExecutePendingJob(rt, ptr.as_mut_ptr()) };
+        let res = unsafe { qjs::JS_ExecuteJob(rt, job.as_ptr(), ptr.as_mut_ptr()) };
         if res < 0 {
-            // A negative result means the job threw, and `JS_ExecutePendingJob`
+            // A negative result means the job threw, and `JS_ExecuteJob`
             // leaves the exception pending on the context it ran in (`*ptr`,
             // which need not be `self` in a multi-context runtime) instead of
             // surfacing it here. Drain it so it can't be mistaken for a real

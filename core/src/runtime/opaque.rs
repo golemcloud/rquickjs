@@ -6,14 +6,19 @@ use crate::{
 use super::{
     exotic::ExoticMethodsHolder,
     userdata::{UserDataGuard, UserDataMap},
-    InterruptHandler, PromiseHook, PromiseHookType, RejectionTracker, UserDataError,
+    InterruptHandler, JobOwnerRedirect, PromiseHook, PromiseHookType, RejectionTracker,
+    UserDataError,
 };
-use alloc::boxed::Box;
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, VecDeque},
+};
 use core::{
     any::{Any, TypeId},
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
+    ffi::c_void,
     marker::PhantomData,
-    ptr,
+    ptr::{self, NonNull},
 };
 
 #[cfg(feature = "std")]
@@ -59,6 +64,15 @@ pub(crate) struct Opaque<'js> {
     #[cfg(feature = "futures")]
     spawner: Option<UnsafeCell<Spawner>>,
 
+    /// The jobs QuickJS handed over through its enqueue hook, per job owner, in enqueue order.
+    jobs: RefCell<BTreeMap<u64, VecDeque<NonNull<qjs::JSJob>>>>,
+
+    /// The job owner whose jobs and spawned futures run now.
+    job_owner: Cell<u64>,
+
+    /// Chooses the owner of a job enqueued for an owner other than the current one.
+    job_owner_redirect: Cell<Option<JobOwnerRedirect>>,
+
     exotic_methods: ExoticMethodsHolder,
 
     _marker: PhantomData<&'js ()>,
@@ -88,6 +102,10 @@ impl<'js> Opaque<'js> {
             #[cfg(feature = "futures")]
             spawner: None,
 
+            jobs: RefCell::new(BTreeMap::new()),
+            job_owner: Cell::new(0),
+            job_owner_redirect: Cell::new(None),
+
             exotic_methods: ExoticMethodsHolder::new(),
         }
     }
@@ -100,6 +118,7 @@ impl<'js> Opaque<'js> {
     }
 
     pub unsafe fn initialize(&mut self, rt: *mut qjs::JSRuntime) -> Result<(), Error> {
+        qjs::JS_SetJobHooks(rt, Some(job_tag), Some(enqueue_job), ptr::null_mut());
         qjs::JS_NewClassID(rt, (&mut self.class_id) as *mut qjs::JSClassID);
         qjs::JS_NewClassID(rt, (&mut self.callable_class_id) as *mut qjs::JSClassID);
         qjs::JS_NewClassID(rt, (&mut self.exotic_class_id) as *mut qjs::JSClassID);
@@ -154,27 +173,86 @@ impl<'js> Opaque<'js> {
             .expect("tried to use async function in non async runtime")
     }
 
+    /// The job owner whose jobs and spawned futures run now.
+    pub fn job_owner(&self) -> u64 {
+        self.job_owner.get()
+    }
+
+    /// Makes `owner` the current job owner and returns the previous one.
+    pub fn set_job_owner(&self, owner: u64) -> u64 {
+        self.job_owner.replace(owner)
+    }
+
+    pub fn set_job_owner_redirect(&self, redirect: Option<JobOwnerRedirect>) {
+        self.job_owner_redirect.set(redirect)
+    }
+
+    /// Returns whether the current job owner has a job.
+    pub fn is_job_pending(&self) -> bool {
+        self.jobs.borrow().contains_key(&self.job_owner())
+    }
+
+    /// Removes the first job of the current job owner. The caller owns the job and must pass it
+    /// to `JS_ExecuteJob` or `JS_FreeJob`.
+    pub fn take_job(&self) -> Option<NonNull<qjs::JSJob>> {
+        Self::pop_job(&mut self.jobs.borrow_mut(), self.job_owner())
+    }
+
+    fn pop_job(
+        jobs: &mut BTreeMap<u64, VecDeque<NonNull<qjs::JSJob>>>,
+        owner: u64,
+    ) -> Option<NonNull<qjs::JSJob>> {
+        let queue = jobs.get_mut(&owner)?;
+        let job = queue.pop_front();
+        if queue.is_empty() {
+            jobs.remove(&owner);
+        }
+        job
+    }
+
+    /// Frees every job of every owner, including jobs that freeing enqueues.
+    ///
+    /// Must be called before the runtime is freed, which requires that no job is left.
+    pub unsafe fn free_jobs(&self, rt: *mut qjs::JSRuntime) {
+        loop {
+            let job = {
+                let mut jobs = self.jobs.borrow_mut();
+                let Some(owner) = jobs.keys().next().copied() else {
+                    return;
+                };
+                Self::pop_job(&mut jobs, owner)
+            };
+            if let Some(job) = job {
+                qjs::JS_FreeJob(rt, job.as_ptr());
+            }
+        }
+    }
+
+    /// Spawns `f` under the current job owner.
     #[cfg(feature = "futures")]
     pub unsafe fn push<F>(&self, f: F)
     where
         F: Future<Output = ()>,
     {
-        (*self.spawner().get()).push(f)
+        (*self.spawner().get()).push(self.job_owner(), f)
     }
 
+    /// Registers a waker that is woken when a future is spawned.
     #[cfg(feature = "futures")]
     pub fn listen(&self, wake: Waker) {
         unsafe { (*self.spawner().get()).listen(wake) };
     }
 
+    /// Returns whether no future is spawned under the current job owner.
     #[cfg(feature = "futures")]
     pub fn spawner_is_empty(&self) -> bool {
-        unsafe { (*self.spawner().get()).is_empty() }
+        unsafe { (*self.spawner().get()).is_empty(self.job_owner()) }
     }
 
+    /// Polls the futures spawned under the current job owner.
     #[cfg(feature = "futures")]
     pub fn poll(&self, cx: &mut Context) -> SchedularPoll {
-        unsafe { (*self.spawner().get()).poll(cx) }
+        unsafe { (*self.spawner().get()).poll(self.job_owner(), cx) }
     }
 
     pub fn insert_userdata<U>(&self, data: U) -> Result<Option<Box<U>>, UserDataError<U>>
@@ -290,4 +368,32 @@ impl<'js> Opaque<'js> {
         self.spawner.take();
         self.userdata.clear();
     }
+}
+
+unsafe extern "C" fn job_tag(rt: *mut qjs::JSRuntime, _opaque: *mut c_void) -> u64 {
+    unsafe { Opaque::from_runtime_ptr(rt) }.job_owner()
+}
+
+/// Queues a job for its tag's owner, or for the owner the redirect chooses when that owner is not
+/// current. QuickJS calls this while it settles a promise or collects garbage, so it must not call
+/// into QuickJS.
+unsafe extern "C" fn enqueue_job(
+    rt: *mut qjs::JSRuntime,
+    job: *mut qjs::JSJob,
+    tag: u64,
+    _opaque: *mut c_void,
+) {
+    let opaque = unsafe { Opaque::from_runtime_ptr(rt) };
+    let current = opaque.job_owner();
+    let owner = match opaque.job_owner_redirect.get() {
+        Some(redirect) if tag != current => redirect(tag, current),
+        _ => tag,
+    };
+    let job = NonNull::new(job).expect("QuickJS enqueued a null job");
+    opaque
+        .jobs
+        .borrow_mut()
+        .entry(owner)
+        .or_default()
+        .push_back(job);
 }

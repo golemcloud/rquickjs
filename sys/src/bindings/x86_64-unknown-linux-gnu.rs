@@ -1668,6 +1668,41 @@ unsafe extern "C" {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct JSJobEntry {
+    _unused: [u8; 0],
+}
+pub type JSJob = JSJobEntry;
+pub type JSJobTagFunc = ::core::option::Option<
+    unsafe extern "C" fn(rt: *mut JSRuntime, opaque: *mut ::core::ffi::c_void) -> u64,
+>;
+pub type JSEnqueueJobHook = ::core::option::Option<
+    unsafe extern "C" fn(
+        rt: *mut JSRuntime,
+        job: *mut JSJob,
+        tag: u64,
+        opaque: *mut ::core::ffi::c_void,
+    ),
+>;
+unsafe extern "C" {
+    pub fn JS_SetJobHooks(
+        rt: *mut JSRuntime,
+        tag_func: JSJobTagFunc,
+        enqueue_hook: JSEnqueueJobHook,
+        opaque: *mut ::core::ffi::c_void,
+    );
+}
+unsafe extern "C" {
+    pub fn JS_ExecuteJob(
+        rt: *mut JSRuntime,
+        job: *mut JSJob,
+        pctx: *mut *mut JSContext,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_FreeJob(rt: *mut JSRuntime, job: *mut JSJob);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct JSSABTab {
     pub tab: *mut *mut u8,
     pub len: size_t,
