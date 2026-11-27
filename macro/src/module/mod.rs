@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use indexmap::{map::Entry, IndexMap};
 
 use crate::{
     attrs::{take_attributes, OptionList},
@@ -17,7 +17,7 @@ pub(crate) use config::*;
 pub(crate) struct JsModule {
     pub config: ModuleConfig,
     pub name: Ident,
-    pub declaration: HashMap<String, (Span, TokenStream)>,
+    pub declaration: IndexMap<String, (Span, TokenStream)>,
 }
 
 impl JsModule {
@@ -25,7 +25,7 @@ impl JsModule {
         JsModule {
             config,
             name: item.ident.clone(),
-            declaration: HashMap::new(),
+            declaration: IndexMap::new(),
         }
     }
 
@@ -456,4 +456,50 @@ pub(crate) fn expand(options: OptionList<ModuleOption>, mut item: ItemMod) -> Re
         #item
     };
     Ok(res)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn declarations_and_exports_follow_source_order() {
+        let input = quote! {
+            mod example {
+                pub use super::{Zebra, Alpha, Middle};
+            }
+        };
+        let options = quote!(crate = "rquickjs");
+        let mut previous = None;
+        for _ in 0..32 {
+            let output = expand(
+                syn::parse2(options.clone()).unwrap(),
+                syn::parse2(input.clone()).unwrap(),
+            )
+            .unwrap()
+            .to_string();
+            for prefix in [
+                "_declare . declare",
+                "_exports . export",
+                "Class :: < example ::",
+            ] {
+                let positions: Vec<_> = ["Zebra", "Alpha", "Middle"]
+                    .iter()
+                    .map(|name| {
+                        let needle = if prefix.starts_with("Class") {
+                            format!("{prefix} {name}")
+                        } else {
+                            format!("{prefix} (\"{name}\"")
+                        };
+                        output.find(&needle).unwrap()
+                    })
+                    .collect();
+                assert!(positions.windows(2).all(|p| p[0] < p[1]), "{output}");
+            }
+            if let Some(previous) = &previous {
+                assert_eq!(&output, previous);
+            }
+            previous = Some(output);
+        }
+    }
 }
