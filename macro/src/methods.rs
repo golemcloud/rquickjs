@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
@@ -131,7 +131,7 @@ pub(crate) fn expand(options: OptionList<ImplOption>, item: ItemImpl) -> Result<
     let prefix = config.prefix.unwrap_or_else(|| BASE_PREFIX.to_string());
     let crate_name = format_ident!("{}", config.crate_.map(Ok).unwrap_or_else(crate_ident)?);
 
-    let mut accessors = HashMap::new();
+    let mut accessors = IndexMap::new();
     let mut functions = Vec::new();
     let mut props = Vec::new();
     let mut constructor: Option<Method> = None;
@@ -302,4 +302,58 @@ pub(crate) fn expand(options: OptionList<ImplOption>, item: ItemImpl) -> Result<
     };
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn accessors_follow_first_source_occurrence() {
+        let input = quote! {
+            impl Example {
+                #[qjs(constructor)]
+                pub fn new() -> Self { Self }
+                #[qjs(set, rename = "zebra")]
+                pub fn set_zebra(&mut self, value: u32) {}
+                #[qjs(get)]
+                pub fn alpha(&self) -> u32 { 1 }
+                #[qjs(get, rename = "zebra")]
+                pub fn get_zebra(&self) -> u32 { 2 }
+                #[qjs(get, static)]
+                pub fn static_zebra() -> u32 { 3 }
+                #[qjs(get, static)]
+                pub fn static_alpha() -> u32 { 4 }
+            }
+        };
+        let options = quote!(crate = "rquickjs");
+        let mut previous = None;
+        for _ in 0..32 {
+            let output = expand(
+                syn::parse2(options.clone()).unwrap(),
+                syn::parse2(input.clone()).unwrap(),
+            )
+            .unwrap()
+            .to_string();
+            for (first, second) in [
+                ("fn get_zebra", "fn alpha"),
+                ("fn set_zebra", "fn alpha"),
+                ("_proto . prop (\"zebra\"", "_proto . prop (\"alpha\""),
+                (
+                    "constr . prop (\"static_zebra\"",
+                    "constr . prop (\"static_alpha\"",
+                ),
+            ] {
+                assert!(
+                    output.find(first).unwrap() < output.find(second).unwrap(),
+                    "{output}"
+                );
+            }
+            assert_eq!(output.matches("_proto . prop (\"zebra\"").count(), 1);
+            if let Some(previous) = &previous {
+                assert_eq!(&output, previous);
+            }
+            previous = Some(output);
+        }
+    }
 }
